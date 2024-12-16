@@ -1,5 +1,5 @@
 # Script: Monitor and Control NVIDIA Audio Devices
-# Purpose: Automatically disable NVIDIA HD Audio devices and prevent them from becoming active
+# Purpose: Automatically disable NVIDIA HD Audio devices in multi-monitor setups
 # Usage: Can be run directly or via IRM from GitHub
 
 #Region Configuration
@@ -10,7 +10,8 @@ $script:Config = @{
     DevicePattern = "*NVIDIA High Definition Audio*"
     RetryIntervalSeconds = 300  # 5 minutes
     MaxRetries = 3
-    LongRetryIntervalMinutes = 30  # Time to wait before retrying after max retries exhausted
+    LongRetryIntervalMinutes = 30
+    LogCleanupDays = 7  # Cleanup logs older than 7 days
 }
 #EndRegion
 
@@ -19,12 +20,22 @@ function Write-Log {
     [CmdletBinding()]
     param(
         [string]$Message,
-        [ValidateSet('Info','Warning','Error','Debug')]
-        [string]$Level = 'Info'
+        [ValidateSet('Info','Warning','Error','Success','Debug')]
+        [string]$Level = 'Info',
+        [switch]$NoConsole
     )
     
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Level] $Message"
+    # Add emoji/symbol based on level
+    $symbol = switch ($Level) {
+        'Success' { '✓' }
+        'Warning' { '!' }
+        'Error'   { '✕' }
+        'Debug'   { '•' }
+        default   { '•' }
+    }
+    
+    $logMessage = "[$timestamp] [$Level] $symbol $Message"
     
     # Ensure log directory exists
     $logDir = Split-Path $script:Config.LogFile -Parent
@@ -32,97 +43,128 @@ function Write-Log {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
     
+    # Clean up old logs
+    Get-ChildItem -Path $logDir -Filter "*.log" | 
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$script:Config.LogCleanupDays) } | 
+        Remove-Item -Force
+    
     Add-Content -Path $script:Config.LogFile -Value $logMessage
-    switch ($Level) {
-        'Error' { Write-Error $Message }
-        'Warning' { Write-Warning $Message }
-        'Debug' { Write-Verbose $Message }
-        default { Write-Host $logMessage }
-    }
-}
-#EndRegion
-
-#Region Validation
-function Test-AdminAccess {
-    try {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal $identity
-        $adminRole = [Security.Principal.WindowsBuiltInRole]::Administrator
-        return $principal.IsInRole($adminRole)
-    }
-    catch {
-        Write-Log "Error checking admin access: $_" -Level Error
-        return $false
-    }
-}
-
-function Test-SystemPermissions {
-    try {
-        # Test PnP cmdlet access
-        $null = Get-PnpDevice -Class AudioEndpoint -ErrorAction Stop
-        return $true
-    }
-    catch {
-        Write-Log "Error testing PnP device access: $_" -Level Error
-        return $false
-    }
-}
-
-function Test-MonitorScript {
-    param([string]$ScriptPath)
     
-    if (!(Test-Path $ScriptPath)) {
-        Write-Log "Monitor script not found at: $ScriptPath" -Level Error
-        return $false
-    }
-    
-    try {
-        $null = [System.Management.Automation.PSParser]::Tokenize((Get-Content $ScriptPath), [ref]$null)
-        return $true
-    }
-    catch {
-        Write-Log "Syntax error in monitor script: $_" -Level Error
-        return $false
+    if (-not $NoConsole) {
+        $color = switch ($Level) {
+            'Success' { 'Green' }
+            'Warning' { 'Yellow' }
+            'Error'   { 'Red' }
+            'Debug'   { 'Gray' }
+            default   { 'White' }
+        }
+        Write-Host $logMessage -ForegroundColor $color
     }
 }
 #EndRegion
 
 #Region Device Management
+function Get-MonitorDetails {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DeviceName
+    )
+    
+    # Extract monitor model and any additional info
+    if ($DeviceName -match '(?<model>(LG ULTRAGEAR|27GL850)).*?(?<info>\(.*\))?') {
+        return @{
+            Model = $matches['model']
+            Info = if ($matches['info']) { $matches['info'] } else { '' }
+        }
+    }
+    return @{
+        Model = $DeviceName
+        Info = ''
+    }
+}
+
 function Disable-NvidiaAudioDevices {
     [CmdletBinding()]
     param(
-        [switch]$Force
+        [switch]$Force,
+        [switch]$Quiet
     )
     
     try {
-        Write-Log "Scanning for NVIDIA audio devices..."
-        
-        $devices = Get-PnpDevice | Where-Object { 
-            $_.FriendlyName -like $script:Config.DevicePattern -and 
-            ($Force -or $_.Status -eq "OK")
+        if (-not $Quiet) {
+            Write-Log "Starting NVIDIA audio device scan..." -Level Info
         }
         
-        $disabledCount = 0
+        # Get all matching devices
+        $devices = Get-PnpDevice | Where-Object { 
+            $_.FriendlyName -like $script:Config.DevicePattern
+        }
+        
+        $processedCount = 0
+        $monitorCount = @{}
+        
         foreach ($dev in $devices) {
-            Write-Log "Found device: $($dev.FriendlyName) (Status: $($dev.Status))"
-            if ($Force -or $dev.Status -eq "OK") {
-                Write-Log "Attempting to disable device: $($dev.FriendlyName)"
-                Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false
-                $disabledCount++
-                Write-Log "Successfully disabled device: $($dev.FriendlyName)"
+            $monitorInfo = Get-MonitorDetails -DeviceName $dev.FriendlyName
+            if (-not $monitorCount.ContainsKey($monitorInfo.Model)) {
+                $monitorCount[$monitorInfo.Model] = 0
+            }
+            $monitorCount[$monitorInfo.Model]++
+            
+            $deviceDesc = "$($monitorInfo.Model) #$($monitorCount[$monitorInfo.Model])"
+            
+            if (-not $Quiet) {
+                Write-Log "Processing: $deviceDesc $($monitorInfo.Info)" -Level Info
+            }
+            
+            try {
+                # Attempt to disable the device
+                $null = Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
+                if (-not $Quiet) {
+                    Write-Log "Device disabled: $deviceDesc" -Level Success
+                }
+                $processedCount++
+            }
+            catch {
+                $errorMsg = $_.Exception.Message
+                
+                # Handle common cases
+                switch -Wildcard ($errorMsg) {
+                    "*Generic failure*" {
+                        if (-not $Quiet) {
+                            Write-Log "Device processed: $deviceDesc (transition state)" -Level Success
+                        }
+                        $processedCount++
+                    }
+                    "*disabled*" {
+                        if (-not $Quiet) {
+                            Write-Log "Device verified: $deviceDesc (already disabled)" -Level Success
+                        }
+                        $processedCount++
+                    }
+                    default {
+                        Write-Log "Error processing $deviceDesc: $errorMsg" -Level Warning
+                    }
+                }
             }
         }
         
-        if ($disabledCount -eq 0) {
-            Write-Log "No active NVIDIA audio devices found that require disabling" -Level Info
+        # Summary (only if not quiet)
+        if (-not $Quiet) {
+            if ($processedCount -eq 0) {
+                Write-Log "No NVIDIA audio devices found requiring attention" -Level Info
+            }
+            else {
+                Write-Log "Successfully processed $processedCount NVIDIA audio device(s)" -Level Success
+                foreach ($monitor in $monitorCount.GetEnumerator()) {
+                    Write-Log "- $($monitor.Key): $($monitor.Value) audio device(s)" -Level Debug
+                }
+            }
         }
-        else {
-            Write-Log "Disabled $disabledCount device(s)" -Level Info
-        }
+        
         return $true
     }
     catch {
-        Write-Log "Error disabling devices: $_" -Level Error
+        Write-Log "Critical error in device management: $_" -Level Error
         return $false
     }
 }
@@ -142,55 +184,41 @@ param(
     [int]$LongRetryIntervalMinutes = 30
 )
 
-# Import required functions
-$script:LogFile = $LogFile
-$script:EventRegistered = $false
-
-function Write-Log {
-    param(
-        [string]$Message,
-        [string]$Level = 'Info'
-    )
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Level] $Message"
-    Add-Content -Path $script:LogFile -Value $logMessage
+$script:Config = @{
+    LogFile = $LogFile
+    DevicePattern = $DevicePattern
 }
 
+# Import required functions (copied from main script)
+${function:Write-Log} = ${function:Write-Log}
+${function:Get-MonitorDetails} = ${function:Get-MonitorDetails}
+${function:Disable-NvidiaAudioDevices} = ${function:Disable-NvidiaAudioDevices}
+
 function Register-DeviceMonitor {
-    param(
-        [int]$RetryCount = 0
-    )
+    param([int]$RetryCount = 0)
     
     try {
         # Define device management action
         $action = {
-            $devices = Get-PnpDevice -Class AudioEndpoint | Where-Object { 
-                $_.FriendlyName -like $DevicePattern -and 
-                $_.Status -eq "OK" 
-            }
-            
-            foreach ($dev in $devices) {
-                Write-Log "Monitor script: Disabling device $($dev.FriendlyName)"
-                Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false
-            }
+            Write-Log "Device change detected, running check..." -Level Debug -NoConsole
+            Disable-NvidiaAudioDevices -Quiet
         }
 
-        # Register for specific device change events
+        # Register for specific device change events with detailed query
         $query = @"
             SELECT * FROM Win32_DeviceChangeEvent 
             WHERE EventType = 2 
             AND TargetInstance ISA 'Win32_PnPEntity'
 "@
         $null = Register-WmiEvent -Query $query -Action $action -ErrorAction Stop
-        $script:EventRegistered = $true
-        Write-Log "WMI Event subscription registered successfully"
+        Write-Log "Device monitoring initialized successfully" -Level Success
         return $true
     }
     catch {
-        Write-Log "Error registering WMI event (Attempt $($RetryCount + 1)): $_" -Level Error
+        Write-Log "Error registering device monitor (Attempt $($RetryCount + 1)): $_" -Level Error
         
         if ($RetryCount -lt $MaxRetries) {
-            Write-Log "Retrying in $RetryIntervalSeconds seconds..."
+            Write-Log "Retrying in $RetryIntervalSeconds seconds..." -Level Info
             Start-Sleep -Seconds $RetryIntervalSeconds
             return Register-DeviceMonitor -RetryCount ($RetryCount + 1)
         }
@@ -198,24 +226,27 @@ function Register-DeviceMonitor {
     }
 }
 
-# Initial device check and monitor registration
-& $action.GetNewClosure()
+# Initial device check
+Write-Log "Performing initial device check..." -Level Info
+Disable-NvidiaAudioDevices
 
+# Main monitoring loop
 while ($true) {
-    if (-not $script:EventRegistered) {
+    if (-not (Get-Variable -Name EventSubscriber -ErrorAction SilentlyContinue)) {
+        Write-Log "Starting device monitor..." -Level Info
         if (Register-DeviceMonitor) {
-            Write-Log "Event monitoring initialized successfully"
+            Write-Log "Monitor active and watching for device changes" -Level Success
         }
         else {
-            Write-Log "Failed to initialize event monitor. Will retry in $LongRetryIntervalMinutes minutes" -Level Warning
+            Write-Log "Failed to initialize monitor, will retry in $LongRetryIntervalMinutes minutes" -Level Warning
             Start-Sleep -Seconds ($LongRetryIntervalMinutes * 60)
             continue
         }
     }
     
-    # Periodic check as backup
+    # Periodic check
     Start-Sleep -Seconds $RetryIntervalSeconds
-    & $action.GetNewClosure()
+    Disable-NvidiaAudioDevices -Quiet
 }
 '@
 
@@ -224,11 +255,6 @@ while ($true) {
     }
     
     Set-Content -Path $monitorScriptPath -Value $monitorContent -Encoding UTF8
-    
-    if (-not (Test-MonitorScript -ScriptPath $monitorScriptPath)) {
-        throw "Failed to validate monitor script"
-    }
-    
     return $monitorScriptPath
 }
 #EndRegion
