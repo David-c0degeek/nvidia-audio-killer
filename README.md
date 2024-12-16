@@ -34,12 +34,12 @@ This command will:
 
 1. Clone the repository:
 ```powershell
-git clone https://github.com/C0deGeek/nvidia-audio-control.git
+git clone https://github.com/David-c0degeek/nvidia-audio-killer.git
 ```
 
 2. Navigate to the script directory:
 ```powershell
-cd nvidia-audio-control
+cd nvidia-audio-killer
 ```
 
 3. Run the script:
