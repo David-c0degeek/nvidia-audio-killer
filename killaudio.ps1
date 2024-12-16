@@ -1,6 +1,8 @@
 # Script: Monitor and Control NVIDIA Audio Devices
 # Purpose: Automatically disable NVIDIA HD Audio devices in multi-monitor setups
 # Usage: Can be run directly or via IRM from GitHub
+# Author: David (C0deGeek)
+# Repository: https://github.com/David-c0degeek/nvidia-audio-killer
 
 #Region Configuration
 $script:Config = @{
@@ -12,6 +14,38 @@ $script:Config = @{
     MaxRetries = 3
     LongRetryIntervalMinutes = 30
     LogCleanupDays = 7  # Cleanup logs older than 7 days
+}
+#EndRegion
+
+#Region Validation
+function Test-AdminAccess {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal $identity
+        $adminRole = [Security.Principal.WindowsBuiltInRole]::Administrator
+        
+        if (-not $principal.IsInRole($adminRole)) {
+            Write-Log "This script requires administrator privileges" -Level Error
+            return $false
+        }
+        return $true
+    }
+    catch {
+        Write-Log "Error checking admin access: $_" -Level Error
+        return $false
+    }
+}
+
+function Test-SystemPermissions {
+    try {
+        # Test PnP cmdlet access
+        $null = Get-PnpDevice -Class AudioEndpoint -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Log "Error testing system permissions: $_" -Level Error
+        return $false
+    }
 }
 #EndRegion
 
@@ -32,7 +66,7 @@ function Write-Log {
         'Warning' { '!' }
         'Error'   { '✕' }
         'Debug'   { '•' }
-        default   { '•' }
+        default   { ' ' }
     }
     
     $logMessage = "[$timestamp] [$Level] $symbol $Message"
@@ -70,7 +104,6 @@ function Get-MonitorDetails {
         [string]$DeviceName
     )
     
-    # Extract monitor model and any additional info
     if ($DeviceName -match '(?<model>(LG ULTRAGEAR|27GL850)).*?(?<info>\(.*\))?') {
         return @{
             Model = $matches['model']
@@ -92,10 +125,9 @@ function Disable-NvidiaAudioDevices {
     
     try {
         if (-not $Quiet) {
-            Write-Log "Starting NVIDIA audio device scan..." -Level Info
+            Write-Log "Scanning for NVIDIA audio devices..." -Level Info
         }
         
-        # Get all matching devices
         $devices = Get-PnpDevice | Where-Object { 
             $_.FriendlyName -like $script:Config.DevicePattern
         }
@@ -112,13 +144,9 @@ function Disable-NvidiaAudioDevices {
             
             $deviceDesc = "$($monitorInfo.Model) #$($monitorCount[$monitorInfo.Model])"
             
-            if (-not $Quiet) {
-                Write-Log "Processing: $deviceDesc $($monitorInfo.Info)" -Level Info
-            }
-            
             try {
-                # Attempt to disable the device
-                $null = Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
+                # Try to disable with suppressed output
+                $null = Disable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
                 if (-not $Quiet) {
                     Write-Log "Device disabled: $deviceDesc" -Level Success
                 }
@@ -127,37 +155,23 @@ function Disable-NvidiaAudioDevices {
             catch {
                 $errorMsg = $_.Exception.Message
                 
-                # Handle common cases
-                switch -Wildcard ($errorMsg) {
-                    "*Generic failure*" {
-                        if (-not $Quiet) {
-                            Write-Log "Device processed: $deviceDesc (transition state)" -Level Success
-                        }
-                        $processedCount++
+                # Handle expected cases silently
+                if ($errorMsg -like "*Generic failure*" -or $errorMsg -like "*disabled*") {
+                    $processedCount++
+                    if (-not $Quiet) {
+                        Write-Log "Device verified: $deviceDesc" -Level Success
                     }
-                    "*disabled*" {
-                        if (-not $Quiet) {
-                            Write-Log "Device verified: $deviceDesc (already disabled)" -Level Success
-                        }
-                        $processedCount++
-                    }
-                    default {
-                        Write-Log "Error processing $deviceDesc: $errorMsg" -Level Warning
-                    }
+                }
+                else {
+                    Write-Log "Failed to disable $deviceDesc`: $errorMsg" -Level Warning
                 }
             }
         }
         
-        # Summary (only if not quiet)
-        if (-not $Quiet) {
-            if ($processedCount -eq 0) {
-                Write-Log "No NVIDIA audio devices found requiring attention" -Level Info
-            }
-            else {
-                Write-Log "Successfully processed $processedCount NVIDIA audio device(s)" -Level Success
-                foreach ($monitor in $monitorCount.GetEnumerator()) {
-                    Write-Log "- $($monitor.Key): $($monitor.Value) audio device(s)" -Level Debug
-                }
+        if (-not $Quiet -and $processedCount -gt 0) {
+            Write-Log "Successfully processed $processedCount NVIDIA audio device(s)" -Level Success
+            foreach ($monitor in $monitorCount.GetEnumerator()) {
+                Write-Log "- $($monitor.Key): $($monitor.Value) audio device(s)" -Level Debug
             }
         }
         
@@ -204,7 +218,7 @@ function Register-DeviceMonitor {
             Disable-NvidiaAudioDevices -Quiet
         }
 
-        # Register for specific device change events with detailed query
+        # Register for specific device change events
         $query = @"
             SELECT * FROM Win32_DeviceChangeEvent 
             WHERE EventType = 2 
@@ -262,7 +276,7 @@ while ($true) {
 #Region Service Management
 function Install-AudioControl {
     try {
-        Write-Log "Starting installation..."
+        Write-Log "Starting installation..." -Level Info
         
         # Verify permissions
         if (-not (Test-AdminAccess)) {
@@ -275,9 +289,9 @@ function Install-AudioControl {
         
         # Create monitor script
         $monitorScript = New-MonitorScript
-        Write-Log "Monitor script created at: $monitorScript"
+        Write-Log "Monitor script created at: $monitorScript" -Level Success
         
-        # Build argument list carefully
+        # Build argument list
         $scriptArguments = @(
             "-WindowStyle Hidden"
             "-ExecutionPolicy Bypass"
@@ -303,7 +317,7 @@ function Install-AudioControl {
                              -Description "Automatically disable NVIDIA HD Audio devices" `
                              -Force
         
-        Write-Log "Installation completed successfully"
+        Write-Log "Installation completed successfully" -Level Success
         
         # Immediate first run
         Disable-NvidiaAudioDevices -Force
@@ -316,21 +330,21 @@ function Install-AudioControl {
 
 function Uninstall-AudioControl {
     try {
-        Write-Log "Starting uninstallation..."
+        Write-Log "Starting uninstallation..." -Level Info
         
         # Remove scheduled task
         if (Get-ScheduledTask -TaskName $script:Config.TaskName -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $script:Config.TaskName -Confirm:$false
-            Write-Log "Scheduled task removed"
+            Write-Log "Scheduled task removed" -Level Success
         }
         
         # Clean up script directory
         if (Test-Path $script:Config.ScriptDir) {
             Remove-Item $script:Config.ScriptDir -Recurse -Force
-            Write-Log "Script directory removed"
+            Write-Log "Script directory removed" -Level Success
         }
         
-        Write-Log "Uninstallation completed successfully"
+        Write-Log "Uninstallation completed successfully" -Level Success
     }
     catch {
         Write-Log "Uninstallation failed: $_" -Level Error
@@ -361,7 +375,7 @@ function Show-Menu {
         '3' {
             $task = Get-ScheduledTask -TaskName $script:Config.TaskName -ErrorAction SilentlyContinue
             if ($task) {
-                Write-Host "`nStatus: Installed and $($task.State)"
+                Write-Host "`nStatus: Installed and $($task.State)" -ForegroundColor Green
                 Write-Host "Last Run Time: $($task.LastRunTime)"
                 Write-Host "Next Run Time: $($task.NextRunTime)"
                 
@@ -370,11 +384,11 @@ function Show-Menu {
                     $_.FriendlyName -like $script:Config.DevicePattern
                 }
                 if ($devices) {
-                    Write-Host "`nCurrent NVIDIA audio devices:"
+                    Write-Host "`nCurrent NVIDIA audio devices:" -ForegroundColor Cyan
                     $devices | Format-Table FriendlyName, Status -AutoSize
                 }
             } else {
-                Write-Host "`nStatus: Not installed"
+                Write-Host "`nStatus: Not installed" -ForegroundColor Yellow
             }
         }
         '4' {
