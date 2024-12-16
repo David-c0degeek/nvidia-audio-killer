@@ -22,7 +22,7 @@ A PowerShell solution to permanently prevent NVIDIA High Definition Audio device
 ### One-Line Installation
 
 ```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force; irm https://raw.githubusercontent.com/C0deGeek/nvidia-audio-control/main/killaudio.ps1 | iex
+Set-ExecutionPolicy Bypass -Scope Process -Force; irm https://raw.githubusercontent.com/David-c0degeek/nvidia-audio-killer/main/killaudio.ps1 | iex
 ```
 
 This command will:
